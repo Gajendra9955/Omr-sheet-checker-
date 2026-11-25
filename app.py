@@ -33,7 +33,7 @@ try:
 except ImportError:
     gspread = None
 
-from omr import scan, evaluate
+from omr import scan, evaluate, read_header, match_shift
 
 st.set_page_config(page_title="OMR Result Checker", page_icon="📝", layout="centered")
 
@@ -41,7 +41,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 KEYFILE = os.path.join(BASE, "keys.json")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 IST = timezone(timedelta(hours=5, minutes=30))
-HEADER = ["Date/Time", "Name", "Shift", "Score", "Correct", "Wrong", "Unattempted", "Image ID"]
+HEADER = ["Date/Time", "Name", "Candidate ID", "Shift", "Score", "Correct", "Wrong", "Unattempted", "Image ID"]
 
 
 def get_secret(name):
@@ -65,7 +65,7 @@ def get_ws():
     return gc.open_by_url(url).sheet1
 
 
-def save_result(name, shift, r, img_id):
+def save_result(name, cand_id, shift, r, img_id):
     """Returns: ok / dup / nocfg / error"""
     try:
         ws = get_ws()
@@ -75,11 +75,11 @@ def save_result(name, shift, r, img_id):
         if not rows:
             ws.append_row(HEADER, value_input_option="RAW")
         for row in rows[1:]:
-            if len(row) > 7 and row[2] == shift and row[7] == img_id:
+            if len(row) > 8 and row[3] == shift and ((cand_id and row[2] == cand_id) or row[8] == img_id):
                 return "dup"
         now = datetime.now(IST).strftime("%d-%m-%Y %H:%M:%S")
         ws.append_row(
-            [now, name, shift, r["score"], r["correct"], r["wrong"], r["unattempted"], img_id],
+            [now, name, cand_id, shift, r["score"], r["correct"], r["wrong"], r["unattempted"], img_id],
             value_input_option="RAW",
         )
         return "ok"
@@ -87,7 +87,41 @@ def save_result(name, shift, r, img_id):
         return "error"
 
 
-def load_keys():
+@st.cache_data(ttl=60, show_spinner=False)
+def get_rank(shift, score):
+    """Sheet ke scores se is shift mein rank. Returns (rank, total) ya None."""
+    try:
+        ws = get_ws()
+        if ws is None:
+            return None
+        mine = []
+        allsc = []
+        for row in ws.get_all_values()[1:]:
+            if len(row) > 4:
+                try:
+                    v = float(row[4].replace(",", "."))
+                except ValueError:
+                    continue
+                allsc.append(v)
+                if row[3] == shift:
+                    mine.append(v)
+        if not mine:
+            return None
+        return (
+            (1 + sum(1 for s in mine if s > score + 1e-9), len(mine)),
+            (1 + sum(1 for s in allsc if s > score + 1e-9), len(allsc)),
+        )
+    except Exception:
+        return None
+
+
+@st.cache_data(show_spinner="Screenshot se naam aur shift padh rahe hain...")
+def cached_header(data):
+    return read_header(data)
+
+
+def load_file_keys():
+    """keys.json (GitHub wali default keys)."""
     try:
         with open(KEYFILE, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -95,9 +129,92 @@ def load_keys():
         return {}
 
 
-def save_keys(d):
+def save_file_keys(d):
     with open(KEYFILE, "w", encoding="utf-8") as f:
         json.dump(d, f, indent=2, ensure_ascii=False)
+
+
+def keys_sheet(create=False):
+    """Google Sheet ka 'Keys' tab. Nahi hai aur create=False ho to None."""
+    ws = get_ws()
+    if ws is None:
+        return None
+    book = ws.spreadsheet
+    try:
+        return book.worksheet("Keys")
+    except gspread.WorksheetNotFound:
+        if not create:
+            return None
+        kws = book.add_worksheet(title="Keys", rows=100, cols=4)
+        kws.append_row(["Shift", "Key", "Marks per correct", "Negative per wrong"], value_input_option="RAW")
+        return kws
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def sheet_keys():
+    """Sheet ke 'Keys' tab ki saari keys (1 minute ke liye yaad rakhi jati hain)."""
+    out = {}
+    try:
+        kws = keys_sheet()
+        if kws is None:
+            return out
+        for row in kws.get_all_values()[1:]:
+            if len(row) < 2 or not row[0].strip() or not row[1].strip():
+                continue
+            kk = "".join(row[1].upper().split())
+            if len(kk) != 110 or any(ch not in "ABCD*" for ch in kk):
+                continue
+            try:
+                pos = float(row[2].replace(",", ".")) if len(row) > 2 and row[2].strip() else 1.0
+                neg = float(row[3].replace(",", ".")) if len(row) > 3 and row[3].strip() else 1 / 3
+            except ValueError:
+                continue
+            out[row[0].strip()] = {"key": kk, "pos": pos, "neg": neg}
+    except Exception:
+        return {}
+    return out
+
+
+def load_keys():
+    """keys.json ki default keys + Sheet ki keys (same naam par Sheet wali chalti hai)."""
+    d = dict(load_file_keys())
+    d.update(sheet_keys())
+    return d
+
+
+def save_key_sheet(name, k, pos, neg):
+    """Key ko Sheet ke 'Keys' tab mein save karta hai. True = ho gaya."""
+    try:
+        kws = keys_sheet(create=True)
+        if kws is None:
+            return False
+        names = kws.col_values(1)
+        row = [name, k, pos, neg]
+        if name in names:
+            i = names.index(name) + 1
+            kws.update(values=[row], range_name="A" + str(i) + ":D" + str(i))
+        else:
+            kws.append_row(row, value_input_option="RAW")
+        sheet_keys.clear()
+        return True
+    except Exception:
+        return False
+
+
+def delete_key_sheet(name):
+    """Shift ko Sheet ke 'Keys' tab se hatata hai. True = hata di."""
+    try:
+        kws = keys_sheet()
+        if kws is None:
+            return False
+        names = kws.col_values(1)
+        if name not in names:
+            return False
+        kws.delete_rows(names.index(name) + 1)
+        sheet_keys.clear()
+        return True
+    except Exception:
+        return False
 
 
 def clean_key(txt):
@@ -105,7 +222,12 @@ def clean_key(txt):
 
 
 st.title("📝 OMR Result Checker")
-tab_c, tab_a = st.tabs(["Candidate", "Admin"])
+# Admin tab sirf tab dikhta hai jab app ke link ke aakhir mein ?admin=1 lagaya ho
+is_admin = st.query_params.get("admin", "") == "1"
+if is_admin:
+    tab_c, tab_a = st.tabs(["Candidate", "Admin"])
+else:
+    tab_c = st.container()
 
 # ---------------------------------------------------------------- Candidate
 with tab_c:
@@ -113,55 +235,75 @@ with tab_c:
     if not keys:
         st.warning("Abhi koi Answer Key available nahi hai. Admin se key add karwayein.")
     else:
-        name = st.text_input("Aapka Naam", max_chars=80).strip()
-        shift = st.selectbox("Shift / Exam chunein", list(keys.keys()))
         up = st.file_uploader("Apni OMR sheet (screenshot) upload karein", type=["png", "jpg", "jpeg"])
-        if up is not None and not name:
-            st.info("Result dekhne ke liye pehle apna Naam bharein.")
-        elif up is not None:
+        if up is not None:
             data = up.getvalue()
             res, cnt = scan(data)
             if res is None:
                 st.error("Image padh nahi payi. Dusri image try karein.")
             else:
-                with st.expander("Uploaded image dekhein"):
-                    st.image(data)
-                if cnt < 40 or cnt > 150:
-                    st.warning(
-                        "Sirf " + str(cnt) + " bhare bubbles mile. Poori OMR sheet ka screenshot "
-                        "(Q1 se Q110 tak) upload karein, warna result galat aa sakta hai."
+                # Naam, ID aur shift screenshot ki upar wali patti se apne aap padhe jate hain
+                hd = cached_header(data)
+                name = hd["name"]
+                cand_id = hd["cand_id"]
+                shift = match_shift(hd["shift_text"], list(keys.keys()))
+                if shift is None:
+                    shift = st.selectbox("Shift chunein (screenshot se apne aap nahi padhi gayi)", list(keys.keys()))
+                if not name:
+                    name = st.text_input("Aapka Naam (screenshot se nahi padha gaya)", max_chars=80).strip()
+                if not name:
+                    st.info("Result dekhne ke liye apna Naam bharein.")
+                else:
+                    with st.expander("Uploaded image dekhein"):
+                        st.image(data)
+                    if cnt < 40 or cnt > 150:
+                        st.warning(
+                            "Sirf " + str(cnt) + " bhare bubbles mile. Poori OMR sheet ka screenshot "
+                            "(Q1 se Q110 tak) upload karein, warna result galat aa sakta hai."
+                        )
+                    cfg = keys[shift]
+                    r = evaluate(res, cfg["key"], float(cfg.get("pos", 1)), float(cfg.get("neg", 1 / 3)))
+                    st.subheader("Result")
+                    st.write("**" + name + "**" + ((" | ID: " + cand_id) if cand_id else ""))
+                    st.caption(shift)
+                    c1, c2 = st.columns(2)
+                    c1.metric("Correct", r["correct"])
+                    c2.metric("Wrong", r["wrong"])
+                    c3, c4 = st.columns(2)
+                    c3.metric("Unattempted", r["unattempted"])
+                    c4.metric("Score", str(r["score"]) + " / " + str(r["total"]))
+                    st.caption(
+                        "Marking: +" + str(cfg.get("pos", 1)) + " sahi, -" + str(round(float(cfg.get("neg", 1 / 3)), 4)) + " galat"
                     )
-                cfg = keys[shift]
-                r = evaluate(res, cfg["key"], float(cfg.get("pos", 1)), float(cfg.get("neg", 1 / 3)))
-                st.subheader("Result")
-                st.write("**" + name + "**")
-                c1, c2 = st.columns(2)
-                c1.metric("Correct", r["correct"])
-                c2.metric("Wrong", r["wrong"])
-                c3, c4 = st.columns(2)
-                c3.metric("Unattempted", r["unattempted"])
-                c4.metric("Score", str(r["score"]) + " / " + str(r["total"]))
-                st.caption(
-                    "Marking: +" + str(cfg.get("pos", 1)) + " sahi, -" + str(round(float(cfg.get("neg", 1 / 3)), 4)) + " galat"
-                )
 
-                # Google Sheet mein save (har result ek hi baar)
-                if "saved" not in st.session_state:
-                    st.session_state["saved"] = {}
-                img_id = hashlib.md5(data).hexdigest()[:12]
-                sig = shift + "|" + img_id
-                if sig not in st.session_state["saved"]:
-                    st.session_state["saved"][sig] = save_result(name, shift, r, img_id)
+                    # Google Sheet mein save (har result ek hi baar)
+                    if "saved" not in st.session_state:
+                        st.session_state["saved"] = {}
+                    img_id = hashlib.md5(data).hexdigest()[:12]
+                    sig = shift + "|" + img_id
+                    if sig not in st.session_state["saved"]:
+                        st.session_state["saved"][sig] = save_result(name, cand_id, shift, r, img_id)
+                    status = st.session_state["saved"][sig]
+                    if status in ("ok", "dup"):
+                        rr = get_rank(shift, r["score"])
+                        if rr:
+                            c5, c6 = st.columns(2)
+                            c5.metric("Rank (is shift mein)", str(rr[0][0]) + " / " + str(rr[0][1]))
+                            c6.metric("Rank (sabhi shifts mein)", str(rr[1][0]) + " / " + str(rr[1][1]))
+                            st.caption("Ye rank sirf un candidates ke beech hai jinhone is website par result nikala hai.")
 
-                df = pd.DataFrame(r["rows"])
-                wrong = df[df["Status"] == "Wrong"]
-                if len(wrong) > 0:
-                    st.write("**Galat answers:**")
-                    st.dataframe(wrong, hide_index=True)
-                with st.expander("Saare 110 questions ka breakdown"):
-                    st.dataframe(df, hide_index=True)
+                    df = pd.DataFrame(r["rows"])
+                    wrong = df[df["Status"] == "Wrong"]
+                    if len(wrong) > 0:
+                        st.write("**Galat answers:**")
+                        st.dataframe(wrong, hide_index=True)
+                    with st.expander("Saare 110 questions ka breakdown"):
+                        st.dataframe(df, hide_index=True)
 
 # --------------------------------------------------------------------- Admin
+if not is_admin:
+    st.stop()
+
 with tab_a:
     if not ADMIN_PASSWORD:
         st.warning("ADMIN_PASSWORD set nahi hai. Secrets mein ADMIN_PASSWORD banayein. Tab tak koi login nahi chalega.")
@@ -209,15 +351,24 @@ with tab_a:
                 elif any(ch not in "ABCD*" for ch in k):
                     st.error("Key mein sirf A, B, C, D ya * hona chahiye.")
                 else:
-                    keys[name_k] = {"key": k, "pos": pos, "neg": neg}
-                    save_keys(keys)
-                    st.success("Save ho gaya: " + name_k)
+                    if save_key_sheet(name_k, k, pos, neg):
+                        st.success("Save ho gaya (Sheet ke 'Keys' tab mein, permanent): " + name_k)
+                    else:
+                        d = load_file_keys()
+                        d[name_k] = {"key": k, "pos": pos, "neg": neg}
+                        save_file_keys(d)
+                        st.warning("Sheet connect nahi hui, isliye key sirf temporary save hui (app restart par ud jayegi): " + name_k)
             if keys and mode == "Purani shift update karein" and name_k:
                 st.divider()
                 sure = st.checkbox("Haan, is shift ko delete karna hai")
                 if st.button("Delete shift") and sure:
-                    keys.pop(name_k, None)
-                    save_keys(keys)
-                    st.success("Delete ho gaya. Page refresh karein.")
+                    gone = delete_key_sheet(name_k)
+                    in_file = name_k in load_file_keys()
+                    if gone:
+                        st.success("Sheet ke 'Keys' tab se delete ho gaya. Page refresh karein.")
+                    if in_file:
+                        st.warning("Ye shift GitHub ki keys.json mein bhi hai. Wahan se hatayein, warna ye wapas dikhegi.")
+                    if not gone and not in_file:
+                        st.info("Ye shift kahin mili nahi.")
         elif pw:
             st.error("Galat password.")

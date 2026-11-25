@@ -1,8 +1,63 @@
+import re
+
 import cv2
 import numpy as np
 
 # Station Master tablet-test sheet ka fixed layout (image width 482 px par)
 XL = [69, 111, 153, 195, 330, 372, 414, 456]
+
+
+def _ocr(img, s, box, cfg):
+    """Screenshot ke ek hisse (box, 482 px width ke hisaab se) ka text padhta hai."""
+    import pytesseract
+
+    x0, y0, x1, y1 = box
+    c = img[int(y0 * s):int(y1 * s), int(x0 * s):int(x1 * s)]
+    if c.size == 0:
+        return ""
+    m = cv2.resize(c.min(axis=2), None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+    _, b = cv2.threshold(m, 170, 255, cv2.THRESH_BINARY)
+    b = cv2.copyMakeBorder(cv2.bitwise_not(b), 20, 20, 20, 20, cv2.BORDER_CONSTANT, value=255)
+    return pytesseract.image_to_string(b, config=cfg).strip()
+
+
+def read_header(data):
+    """Upar ki pink patti se naam, candidate ID aur shift ka text. Fail hone par sab khali."""
+    out = {"name": "", "cand_id": "", "shift_text": ""}
+    try:
+        arr = np.frombuffer(data, np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None:
+            return out
+        s = img.shape[1] / 482.0
+        title = _ocr(img, s, (36, 0, 335, 32), "--psm 7")
+        cid = _ocr(img, s, (335, 0, 422, 32), "--psm 7 -c tessedit_char_whitelist=0123456789")
+        letter = _ocr(img, s, (36, 30, 62, 62), "--psm 10 -c tessedit_char_whitelist=ABCDEFGH")
+        name = _ocr(img, s, (70, 30, 422, 62), "--psm 7")
+    except Exception:
+        return out
+    name = re.sub(r"[^A-Za-z .'-]", "", name)
+    name = " ".join(name.split()).title()
+    out["name"] = name if len(name) >= 3 else ""
+    out["cand_id"] = cid if len(cid) >= 6 else ""
+    out["shift_text"] = (title + " " + letter).strip()
+    return out
+
+
+def _norm(t):
+    t = re.sub(r"[^A-Z0-9]", "", t.upper().replace("$", "S"))
+    return t.replace("0", "O").replace("I", "1").replace("L", "1")
+
+
+def match_shift(text, names):
+    """Screenshot ke shift text ko keys ke naam se exact milata hai. Na mile to None."""
+    if not text:
+        return None
+    t = _norm(text)
+    for nm in names:
+        if _norm(nm) == t:
+            return nm
+    return None
 
 
 def scan(data):
