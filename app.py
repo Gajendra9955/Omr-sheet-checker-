@@ -41,7 +41,7 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 KEYFILE = os.path.join(BASE, "keys.json")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 IST = timezone(timedelta(hours=5, minutes=30))
-HEADER = ["Date/Time", "Name", "Roll Number", "Shift", "Score", "Correct", "Wrong", "Unattempted"]
+HEADER = ["Date/Time", "Name", "Shift", "Score", "Correct", "Wrong", "Unattempted", "Image ID"]
 
 
 def get_secret(name):
@@ -65,7 +65,7 @@ def get_ws():
     return gc.open_by_url(url).sheet1
 
 
-def save_result(name, roll, shift, r):
+def save_result(name, shift, r, img_id):
     """Returns: ok / dup / nocfg / error"""
     try:
         ws = get_ws()
@@ -75,11 +75,11 @@ def save_result(name, roll, shift, r):
         if not rows:
             ws.append_row(HEADER, value_input_option="RAW")
         for row in rows[1:]:
-            if len(row) > 3 and row[2].strip().lower() == roll.lower() and row[3] == shift:
+            if len(row) > 7 and row[2] == shift and row[7] == img_id:
                 return "dup"
         now = datetime.now(IST).strftime("%d-%m-%Y %H:%M:%S")
         ws.append_row(
-            [now, name, roll, shift, r["score"], r["correct"], r["wrong"], r["unattempted"]],
+            [now, name, shift, r["score"], r["correct"], r["wrong"], r["unattempted"], img_id],
             value_input_option="RAW",
         )
         return "ok"
@@ -114,11 +114,10 @@ with tab_c:
         st.warning("Abhi koi Answer Key available nahi hai. Admin se key add karwayein.")
     else:
         name = st.text_input("Aapka Naam", max_chars=80).strip()
-        roll = st.text_input("Roll Number", max_chars=30).strip()
         shift = st.selectbox("Shift / Exam chunein", list(keys.keys()))
         up = st.file_uploader("Apni OMR sheet (screenshot) upload karein", type=["png", "jpg", "jpeg"])
-        if up is not None and (not name or not roll):
-            st.info("Result dekhne ke liye pehle apna Naam aur Roll Number bharein.")
+        if up is not None and not name:
+            st.info("Result dekhne ke liye pehle apna Naam bharein.")
         elif up is not None:
             data = up.getvalue()
             res, cnt = scan(data)
@@ -135,7 +134,7 @@ with tab_c:
                 cfg = keys[shift]
                 r = evaluate(res, cfg["key"], float(cfg.get("pos", 1)), float(cfg.get("neg", 1 / 3)))
                 st.subheader("Result")
-                st.write("**" + name + "** | Roll No: **" + roll + "**")
+                st.write("**" + name + "**")
                 c1, c2 = st.columns(2)
                 c1.metric("Correct", r["correct"])
                 c2.metric("Wrong", r["wrong"])
@@ -149,16 +148,10 @@ with tab_c:
                 # Google Sheet mein save (har result ek hi baar)
                 if "saved" not in st.session_state:
                     st.session_state["saved"] = {}
-                sig = roll.lower() + "|" + shift + "|" + hashlib.md5(data).hexdigest()
+                img_id = hashlib.md5(data).hexdigest()[:12]
+                sig = shift + "|" + img_id
                 if sig not in st.session_state["saved"]:
-                    st.session_state["saved"][sig] = save_result(name, roll, shift, r)
-                status = st.session_state["saved"][sig]
-                if status == "ok":
-                    st.success("Aapka result save ho gaya.")
-                elif status == "dup":
-                    st.info("Is Roll Number ka result is shift ke liye pehle se saved hai.")
-                elif status == "error":
-                    st.warning("Result abhi sheet mein save nahi ho paya. Aapka score upar sahi dikh raha hai.")
+                    st.session_state["saved"][sig] = save_result(name, shift, r, img_id)
 
                 df = pd.DataFrame(r["rows"])
                 wrong = df[df["Status"] == "Wrong"]
