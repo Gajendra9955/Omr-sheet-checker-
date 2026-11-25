@@ -65,6 +65,13 @@ def get_ws():
     return gc.open_by_url(url).sheet1
 
 
+def body_rows(rows):
+    """Header wali pehli row hatata hai. Header na ho to saari rows data mani jati hain."""
+    if rows and rows[0] and rows[0][0].strip() == HEADER[0]:
+        return rows[1:]
+    return rows
+
+
 def save_result(name, cand_id, shift, r, img_id):
     """Returns: ok / dup / nocfg / error"""
     try:
@@ -74,9 +81,12 @@ def save_result(name, cand_id, shift, r, img_id):
         rows = ws.get_all_values()
         if not rows:
             ws.append_row(HEADER, value_input_option="RAW")
-        for row in rows[1:]:
-            if len(row) > 8 and row[3] == shift and ((cand_id and row[2] == cand_id) or row[8] == img_id):
-                return "dup"
+        for row in body_rows(rows):
+            if len(row) > 3 and row[3] == shift:
+                if cand_id and row[2] == cand_id:
+                    return "dup"
+                if len(row) > 8 and row[8] == img_id:
+                    return "dup"
         now = datetime.now(IST).strftime("%d-%m-%Y %H:%M:%S")
         ws.append_row(
             [now, name, cand_id, shift, r["score"], r["correct"], r["wrong"], r["unattempted"], img_id],
@@ -96,7 +106,7 @@ def get_rank(shift, score):
             return None
         mine = []
         allsc = []
-        for row in ws.get_all_values()[1:]:
+        for row in body_rows(ws.get_all_values()):
             if len(row) > 4:
                 try:
                     v = float(row[4].replace(",", "."))
@@ -158,7 +168,10 @@ def sheet_keys():
         kws = keys_sheet()
         if kws is None:
             return out
-        for row in kws.get_all_values()[1:]:
+        rows_k = kws.get_all_values()
+        if rows_k and rows_k[0] and rows_k[0][0].strip().lower() == "shift":
+            rows_k = rows_k[1:]
+        for row in rows_k:
             if len(row) < 2 or not row[0].strip() or not row[1].strip():
                 continue
             kk = "".join(row[1].upper().split())
@@ -248,18 +261,24 @@ with tab_c:
                 cand_id = hd["cand_id"]
                 shift = match_shift(hd["shift_text"], list(keys.keys()))
                 if shift is None:
-                    shift = st.selectbox("Shift chunein (screenshot se apne aap nahi padhi gayi)", list(keys.keys()))
+                    pick = st.selectbox(
+                        "Shift chunein (screenshot se apne aap nahi padhi gayi)",
+                        ["-- Shift chunein --"] + list(keys.keys()),
+                    )
+                    shift = None if pick == "-- Shift chunein --" else pick
                 if not name:
                     name = st.text_input("Aapka Naam (screenshot se nahi padha gaya)", max_chars=80).strip()
                 if not name:
                     st.info("Result dekhne ke liye apna Naam bharein.")
+                elif shift is None:
+                    st.info("Result dekhne ke liye apni Shift chunein.")
                 else:
                     with st.expander("Uploaded image dekhein"):
                         st.image(data)
                     if cnt < 40 or cnt > 150:
                         st.warning(
                             "Sirf " + str(cnt) + " bhare bubbles mile. Poori OMR sheet ka screenshot "
-                            "(Q1 se Q110 tak) upload karein, warna result galat aa sakta hai."
+                            "(Q1 se Q110 tak) upload karein. Ye result Sheet mein save nahi kiya gaya."
                         )
                     cfg = keys[shift]
                     r = evaluate(res, cfg["key"], float(cfg.get("pos", 1)), float(cfg.get("neg", 1 / 3)))
@@ -281,9 +300,12 @@ with tab_c:
                         st.session_state["saved"] = {}
                     img_id = hashlib.md5(data).hexdigest()[:12]
                     sig = shift + "|" + img_id
-                    if sig not in st.session_state["saved"]:
-                        st.session_state["saved"][sig] = save_result(name, cand_id, shift, r, img_id)
-                    status = st.session_state["saved"][sig]
+                    if cnt < 40 or cnt > 150:
+                        status = "skip"
+                    else:
+                        if sig not in st.session_state["saved"]:
+                            st.session_state["saved"][sig] = save_result(name, cand_id, shift, r, img_id)
+                        status = st.session_state["saved"][sig]
                     if status in ("ok", "dup"):
                         rr = get_rank(shift, r["score"])
                         if rr:
