@@ -33,7 +33,7 @@ try:
 except ImportError:
     gspread = None
 
-from omr import scan, evaluate, read_header, match_shift
+from omr import scan, evaluate, read_header, pick_shift
 
 st.set_page_config(page_title="OMR Result Checker", page_icon="📝", layout="centered")
 
@@ -281,9 +281,9 @@ with tab_c:
                 hd = cached_header(data)
                 name = hd["name"]
                 cand_id = hd["cand_id"]
-                shift = match_shift([hd["shift_text"], hd.get("shift_alt", "")], list(keys.keys()), alias_map(keys))
+                shift = pick_shift(hd, list(keys.keys()), alias_map(keys))
                 if shift is None:
-                    seen = hd.get("shift_alt", "") or hd["shift_text"]
+                    seen = hd.get("shift_text", "")
                     if seen:
                         st.caption("Screenshot par ye padha gaya: " + seen)
                     pick = st.selectbox(
