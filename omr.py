@@ -23,7 +23,7 @@ def _ocr(img, s, box, cfg):
 
 def read_header(data):
     """Upar ki pink patti se naam, candidate ID aur shift ka text. Fail hone par sab khali."""
-    out = {"name": "", "cand_id": "", "shift_text": ""}
+    out = {"name": "", "cand_id": "", "shift_text": "", "shift_alt": ""}
     try:
         arr = np.frombuffer(data, np.uint8)
         img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -32,8 +32,11 @@ def read_header(data):
         s = img.shape[1] / 482.0
         title = _ocr(img, s, (36, 0, 335, 32), "--psm 7")
         cid = _ocr(img, s, (335, 0, 422, 32), "--psm 7 -c tessedit_char_whitelist=0123456789")
-        letter = _ocr(img, s, (36, 30, 62, 62), "--psm 10 -c tessedit_char_whitelist=ABCDEFGH")
+        letter = _ocr(img, s, (36, 30, 62, 62), "--psm 10 -c tessedit_char_whitelist=ABCDEFGH12345678")
         name = _ocr(img, s, (70, 30, 422, 62), "--psm 7")
+        # Poora title block (dono lines), ek line mein jodkar. Lamba title do lines mein toot jaye to bhi chalta hai
+        block = _ocr(img, s, (36, 0, 335, 62), "--psm 6")
+        out["shift_alt"] = " ".join(block.split())
     except Exception:
         return out
     name = re.sub(r"[^A-Za-z .'-]", "", name)
@@ -49,14 +52,27 @@ def _norm(t):
     return t.replace("0", "O").replace("I", "1").replace("L", "1")
 
 
-def match_shift(text, names):
-    """Screenshot ke shift text ko keys ke naam se exact milata hai. Na mile to None."""
-    if not text:
-        return None
-    t = _norm(text)
-    for nm in names:
-        if _norm(nm) == t:
-            return nm
+def match_shift(texts, names, aliases=None):
+    """Screenshot ke shift text (ek ya kai) ko keys ke naam ya unke alias se exact milata hai.
+
+    texts: ek string ya strings ki list. aliases: {alias naam: shift ka naam}.
+    Na mile to None.
+    """
+    if isinstance(texts, str):
+        texts = [texts]
+    norm_names = {_norm(nm): nm for nm in names}
+    norm_alias = {}
+    for a, nm in (aliases or {}).items():
+        if _norm(a):
+            norm_alias[_norm(a)] = nm
+    for tx in texts:
+        if not tx:
+            continue
+        t = _norm(tx)
+        if t in norm_names:
+            return norm_names[t]
+        if t in norm_alias:
+            return norm_alias[t]
     return None
 
 

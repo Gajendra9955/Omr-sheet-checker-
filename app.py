@@ -155,8 +155,11 @@ def keys_sheet(create=False):
     except gspread.WorksheetNotFound:
         if not create:
             return None
-        kws = book.add_worksheet(title="Keys", rows=100, cols=4)
-        kws.append_row(["Shift", "Key", "Marks per correct", "Negative per wrong"], value_input_option="RAW")
+        kws = book.add_worksheet(title="Keys", rows=100, cols=5)
+        kws.append_row(
+            ["Shift", "Key", "Marks per correct", "Negative per wrong", "Aliases"],
+            value_input_option="RAW",
+        )
         return kws
 
 
@@ -182,10 +185,17 @@ def sheet_keys():
                 neg = float(row[3].replace(",", ".")) if len(row) > 3 and row[3].strip() else 1 / 3
             except ValueError:
                 continue
-            out[row[0].strip()] = {"key": kk, "pos": pos, "neg": neg}
+            al = split_aliases(row[4]) if len(row) > 4 else []
+            out[row[0].strip()] = {"key": kk, "pos": pos, "neg": neg, "aliases": al}
     except Exception:
         return {}
     return out
+
+
+def split_aliases(txt):
+    """'a, b; c' -> ['a', 'b', 'c']"""
+    parts = txt.replace(";", ",").replace("|", ",").replace("\n", ",").split(",")
+    return [p.strip() for p in parts if p.strip()]
 
 
 def load_keys():
@@ -195,17 +205,29 @@ def load_keys():
     return d
 
 
-def save_key_sheet(name, k, pos, neg):
+def alias_map(keys):
+    """{alias naam: shift ka naam}"""
+    m = {}
+    for nm, cfg in keys.items():
+        for a in cfg.get("aliases", []) or []:
+            m[a] = nm
+    return m
+
+
+def save_key_sheet(name, k, pos, neg, aliases=""):
     """Key ko Sheet ke 'Keys' tab mein save karta hai. True = ho gaya."""
     try:
         kws = keys_sheet(create=True)
         if kws is None:
             return False
+        if kws.col_count < 5:
+            kws.resize(cols=5)
+            kws.update(values=[["Aliases"]], range_name="E1")
         names = kws.col_values(1)
-        row = [name, k, pos, neg]
+        row = [name, k, pos, neg, aliases]
         if name in names:
             i = names.index(name) + 1
-            kws.update(values=[row], range_name="A" + str(i) + ":D" + str(i))
+            kws.update(values=[row], range_name="A" + str(i) + ":E" + str(i))
         else:
             kws.append_row(row, value_input_option="RAW")
         sheet_keys.clear()
@@ -259,8 +281,11 @@ with tab_c:
                 hd = cached_header(data)
                 name = hd["name"]
                 cand_id = hd["cand_id"]
-                shift = match_shift(hd["shift_text"], list(keys.keys()))
+                shift = match_shift([hd["shift_text"], hd.get("shift_alt", "")], list(keys.keys()), alias_map(keys))
                 if shift is None:
+                    seen = hd.get("shift_alt", "") or hd["shift_text"]
+                    if seen:
+                        st.caption("Screenshot par ye padha gaya: " + seen)
                     pick = st.selectbox(
                         "Shift chunein (screenshot se apne aap nahi padhi gayi)",
                         ["-- Shift chunein --"] + list(keys.keys()),
@@ -364,6 +389,12 @@ with tab_a:
             k1, k2 = st.columns(2)
             pos = k1.number_input("Sahi answer ke marks", value=float(cur.get("pos", 1.0)), step=0.25)
             neg = k2.number_input("Galat answer ka negative", value=float(cur.get("neg", 1 / 3)), step=0.05, format="%.4f")
+            al_txt = st.text_input(
+                "Alag naam (alias), comma se alag. Jaise: Goods Train Manager 05 Oct 2026 S2_2",
+                value=", ".join(cur.get("aliases", []) or []),
+                key="alias_" + name_k,
+            )
+            st.caption("Agar kisi screenshot par is shift ka title alag likha aata hai, to use yahan likhein, bilkul waisa jaisa screenshot par hai.")
             if st.button("Save Answer Key"):
                 k = clean_key(kt)
                 if not name_k:
@@ -373,11 +404,12 @@ with tab_a:
                 elif any(ch not in "ABCD*" for ch in k):
                     st.error("Key mein sirf A, B, C, D ya * hona chahiye.")
                 else:
-                    if save_key_sheet(name_k, k, pos, neg):
+                    al_list = split_aliases(al_txt)
+                    if save_key_sheet(name_k, k, pos, neg, ", ".join(al_list)):
                         st.success("Save ho gaya (Sheet ke 'Keys' tab mein, permanent): " + name_k)
                     else:
                         d = load_file_keys()
-                        d[name_k] = {"key": k, "pos": pos, "neg": neg}
+                        d[name_k] = {"key": k, "pos": pos, "neg": neg, "aliases": al_list}
                         save_file_keys(d)
                         st.warning("Sheet connect nahi hui, isliye key sirf temporary save hui (app restart par ud jayegi): " + name_k)
             if keys and mode == "Purani shift update karein" and name_k:
