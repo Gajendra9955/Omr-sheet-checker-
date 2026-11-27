@@ -131,6 +131,73 @@ def save_result(name, cand_id, shift, r, img_id, cat, src):
         return "error"
 
 
+# ------------------------------------------------------------ reports (score galat lage to)
+REPORT_HEADER = ["Date/Time", "Image ID", "Candidate ID", "Name", "Shift", "Score", "Reason", "Note", "Status"]
+REPORT_REASONS = [
+    "Answer key galat lag rahi hai",
+    "Mere jawab galat padhe gaye",
+    "Shift galat pehchani gayi",
+    "Kuch aur",
+]
+
+
+def reports_sheet(create=False):
+    ws = get_ws()
+    if ws is None:
+        return None
+    book = ws.spreadsheet
+    try:
+        return book.worksheet("Reports")
+    except gspread.WorksheetNotFound:
+        if not create:
+            return None
+        rws = book.add_worksheet(title="Reports", rows=200, cols=len(REPORT_HEADER))
+        rws.append_row(REPORT_HEADER, value_input_option="RAW")
+        return rws
+
+
+def save_report(img_id, cand_id, name, shift, score, reason, note):
+    """Returns: ok / dup / nocfg / error"""
+    try:
+        if get_ws() is None:
+            return "nocfg"
+        rws = reports_sheet(create=True)
+        if rws is None:
+            return "nocfg"
+        rows = board.with_retry(lambda: rws.get_all_values())
+        for row in rows[1:]:
+            if len(row) > 1 and row[1].strip() == img_id:
+                return "dup"
+        now = datetime.now(IST).strftime("%d-%m-%Y %H:%M:%S")
+        line = [now, img_id, cand_id, name, shift, score, reason, note, "new"]
+        board.with_retry(lambda: rws.append_row(line, value_input_option="RAW"))
+        return "ok"
+    except Exception:
+        return "error"
+
+
+def report_box(name, cand_id, shift, score, img_id):
+    with st.expander("Score galat lag raha hai? Report karein"):
+        mine = st.session_state.setdefault("reported", {})
+        if img_id in mine:
+            st.info("Aapki report pehle hi bheji ja chuki hai. Admin ise dekhega.")
+            return
+        reason = st.selectbox("Kya dikkat hai?", REPORT_REASONS, key="rep_reason_" + img_id)
+        note = st.text_area(
+            "Kaunsa sawaal aur kya galat hai? (jaise: Q27 ka jawab C hona chahiye)",
+            max_chars=300, key="rep_note_" + img_id,
+        ).strip()
+        if st.button("Report bhejein", key="rep_btn_" + img_id):
+            res = save_report(img_id, cand_id, name, shift, score, reason, note)
+            mine[img_id] = res
+            if res in ("ok", "dup"):
+                st.success("Report bhej di gayi. Dhanyavaad.")
+            elif res == "nocfg":
+                st.warning("Abhi report nahi bheji ja sakti. Baad mein try karein.")
+            else:
+                st.error("Report save nahi ho paayi. Thodi der baad dobara try karein.")
+
+
 # ------------------------------------------------------------ answer keys
 def load_file_keys():
     """keys.json (GitHub wali default keys)."""
@@ -534,6 +601,7 @@ def handle_upload(up, name_in, cat_in, keys):
         st.dataframe(wrong, hide_index=True)
     with st.expander("Saare 110 questions ka breakdown"):
         st.dataframe(df, hide_index=True)
+    report_box(name, cand_id, shift, r["score"], img_id)
 
 
 def lookup_box():
@@ -661,6 +729,31 @@ with tab_a:
                     st.info("Storage tak nahi pahunch paya." if dr is None else str(dr[0]) + " images hata di (kul " + str(dr[1]) + " mein se).")
             else:
                 st.caption("Image storage chalu nahi hai (Secrets mein SUPABASE_URL aur SUPABASE_KEY nahi mili).")
+
+            st.divider()
+            st.write("**Candidate reports (score galat)**")
+            try:
+                rws = reports_sheet()
+                rrows = board.with_retry(lambda: rws.get_all_values()) if rws is not None else []
+            except Exception:
+                rrows = []
+            pend = [(n + 1, row) for n, row in enumerate(rrows) if n > 0 and (row + [""] * 9)[8].strip().lower() in ("new", "")]
+            if not pend:
+                st.caption("Abhi koi nayi report nahi hai.")
+            else:
+                st.caption(str(len(pend)) + " nayi reports.")
+                rdf = pd.DataFrame([(r + [""] * 9)[:9] for _, r in pend], columns=REPORT_HEADER)
+                rdf.insert(0, "row_no", [n for n, _ in pend])
+                st.dataframe(rdf[["row_no", "Date/Time", "Name", "Candidate ID", "Shift", "Score", "Reason", "Note"]], hide_index=True)
+                pick_rep = st.selectbox("Report (row_no)", [n for n, _ in pend], key="rep_pick")
+                b1, b2 = st.columns(2)
+                for bt, lab, newst in ((b1, "Theek kiya (resolved)", "resolved"), (b2, "Reject (galat report)", "rejected")):
+                    if bt.button(lab, key="rep_" + newst):
+                        try:
+                            board.with_retry(lambda: rws.update(values=[[newst]], range_name="I" + str(pick_rep)))
+                            st.success("Row " + str(pick_rep) + " -> " + newst + ". Page refresh karein.")
+                        except Exception as e:
+                            st.error("Update nahi ho paya: " + type(e).__name__)
 
             st.divider()
             st.write("**PDF se Answer Key**")
