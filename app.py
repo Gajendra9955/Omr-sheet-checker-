@@ -691,7 +691,7 @@ with tab_a:
                     diff = [i + 1 for i in range(110) if old["key"][i:i + 1] != pk[i]]
                     if diff:
                         st.warning(pdf_name + ": pehle se hai aur " + str(len(diff)) + " sawaalon mein alag hai: " + ", ".join(map(str, diff[:20])))
-                        go = st.checkbox("Haan, '" + pdf_name + "' ki purani key badalni hai", key="pdfover_" + str(fi))
+                        go = st.checkbox("Haan, '" + pdf_name + "' ki purani key badalni hai", key="pdfover_" + str(fi) + "_" + pdf_name)
                     else:
                         st.info(pdf_name + ": pehle se bilkul yahi key hai, kuch badalna nahi.")
                         go = False
