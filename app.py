@@ -554,7 +554,7 @@ def lookup_box():
 
 
 st.title("📝 OMR Result Checker")
-st.caption("Created by Gajendra")
+st.caption("Created by Gajendra Verma")
 # Admin tab sirf tab dikhta hai jab app ke link ke aakhir mein ?admin=1 lagaya ho
 is_admin = st.query_params.get("admin", "") == "1"
 if is_admin:
