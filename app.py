@@ -31,6 +31,7 @@ except ImportError:
     gspread = None
 
 import board
+import keyparse
 from omr import scan, evaluate, read_header, pick_shift, validate_omr, images_from_zip, is_zip, MAX_FILE
 
 st.set_page_config(page_title="OMR Result Checker", page_icon="📝", layout="centered")
@@ -41,7 +42,7 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 IST = timezone(timedelta(hours=5, minutes=30))
 PLACEHOLDER_CAT = "-- Category chunein --"
 PLACEHOLDER_SHIFT = "-- Shift chunein --"
-NOTICE = "आपकी रैंक अनुमानित हो सकती है यह आधिकारिक नहीं है यह रैंक आपकी उन कैंडिडेट के बीच ही है जिन्होंने इस ऐप में चेक किया है."
+NOTICE = "Rank ke liye aapka naam, ID, category aur score save hote hain. Dashboard mein sirf masked ID aur marks dikhte hain."
 
 
 # ------------------------------------------------------------ secrets, Sheet
@@ -602,7 +603,44 @@ with tab_a:
                 st.download_button("Poora data (CSV)", data=csv, file_name="omr_results.csv", mime="text/csv", key="adm_csv")
 
             st.divider()
-            st.write("**Answer Key**")
+            st.write("**PDF se Answer Key**")
+            kpdf = st.file_uploader("Key PDF (keyTemplate) upload karein", type=["pdf"], key="keypdf")
+            if kpdf is not None:
+                pr = keyparse.parse_key_pdf(kpdf.getvalue())
+                if pr["problems"]:
+                    for pmsg in pr["problems"][:6]:
+                        st.error(pmsg)
+                    st.caption("Is PDF se key nahi bani. Neeche manual box use karein.")
+                else:
+                    pdf_name = st.text_input("Shift ka naam (PDF se padha, zaroorat ho to badlein)", value=pr["shift"], key="pdfname_" + pr["shift"]).strip()
+                    pk = pr["key"]
+                    st.caption("110 jawab mile. Neeche 10-10 ke group mein hain, ek baar milakar dekh lein:")
+                    st.code("\n".join(
+                        "%3d-%3d  %s" % (i + 1, i + 10, " ".join(pk[i:i + 10])) for i in range(0, 110, 10)
+                    ))
+                    old = load_keys().get(pdf_name)
+                    over_ok = True
+                    if old:
+                        diff = [i + 1 for i in range(110) if old["key"][i:i + 1] != pk[i]]
+                        if diff:
+                            st.warning("Is naam ki key pehle se hai aur " + str(len(diff)) + " sawaalon mein alag hai: " + ", ".join(map(str, diff[:20])))
+                            over_ok = st.checkbox("Haan, purani key badalni hai", key="pdfover")
+                        else:
+                            st.info("Is naam ki key pehle se bilkul yahi hai.")
+                    if st.button("PDF wali key save karein"):
+                        if not pdf_name:
+                            st.error("Shift ka naam likhein.")
+                        elif not over_ok:
+                            st.error("Pehle 'Haan, purani key badalni hai' tick karein.")
+                        else:
+                            prev = old or {}
+                            if save_key_sheet(pdf_name, pk, float(prev.get("pos", 1.0)), float(prev.get("neg", 1 / 3)), ", ".join(prev.get("aliases", []) or [])):
+                                st.success("Save ho gaya (Sheet ke 'Keys' tab mein, permanent): " + pdf_name)
+                            else:
+                                st.warning("Sheet connect nahi hui, key save nahi hui.")
+
+            st.divider()
+            st.write("**Answer Key (manual)**")
             keys = load_keys()
             mode = st.radio("Kya karna hai?", ["Purani shift update karein", "Nayi shift add karein"], horizontal=True)
             cur = {}
