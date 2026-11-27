@@ -41,7 +41,7 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 IST = timezone(timedelta(hours=5, minutes=30))
 PLACEHOLDER_CAT = "-- Category chunein --"
 PLACEHOLDER_SHIFT = "-- Shift chunein --"
-NOTICE = "Rank ke liye aapka naam, ID, category aur score save hote hain. Dashboard mein sirf masked ID aur marks dikhte hain."
+NOTICE = "आपकी रैंक अनुमानित हो सकती है यह आधिकारिक नहीं है यह रैंक आपकी उन कैंडिडेट के बीच ही है जिन्होंने इस ऐप में चेक किया है."
 
 
 # ------------------------------------------------------------ secrets, Sheet
