@@ -32,6 +32,7 @@ except ImportError:
 
 import board
 import keyparse
+import store
 from omr import scan, evaluate, read_header, pick_shift, validate_omr, images_from_zip, is_zip, MAX_FILE
 
 st.set_page_config(page_title="OMR Result Checker", page_icon="📝", layout="centered")
@@ -42,7 +43,8 @@ ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 IST = timezone(timedelta(hours=5, minutes=30))
 PLACEHOLDER_CAT = "-- Category chunein --"
 PLACEHOLDER_SHIFT = "-- Shift chunein --"
-NOTICE = "आपकी रैंक अनुमानित हो सकती है यह आधिकारिक नहीं है यह रैंक आपकी उन कैंडिडेट के बीच ही है जिन्होंने इस ऐप में चेक किया है."
+NOTICE = ("Rank ke liye aapka naam, ID, category aur score save hote hain. Dashboard mein sirf masked ID aur marks dikhte hain. "
+          "Verification ke liye kuch screenshots 30 din tak rakhe ja sakte hain.")
 
 
 # ------------------------------------------------------------ secrets, Sheet
@@ -70,7 +72,7 @@ def get_ws():
 @st.cache_resource
 def counters():
     """Admin ke liye ginti (app restart hone par zero ho jati hai)."""
-    return {"uploads": 0, "invalid": 0, "saved": 0, "failed_saves": 0, "manual_skipped": 0}
+    return {"uploads": 0, "invalid": 0, "saved": 0, "failed_saves": 0, "manual_skipped": 0, "unverified": 0, "stored": 0}
 
 
 def once(tag):
@@ -397,6 +399,16 @@ def show_ranks(groups, own, uid):
 
 
 # ------------------------------------------------------------ candidate screen
+def keep_proof(img, img_id):
+    """Shak wali image ko Supabase mein rakhna. Fail ho to chupchap chhod dena (candidate ka result na rukey)."""
+    url, key = get_secret("SUPABASE_URL"), get_secret("SUPABASE_KEY")
+    if not url or not key or not once("proof|" + img_id):
+        return
+    jpg = store.compress(img)
+    if jpg and store.upload(url, key, img_id, jpg):
+        counters()["stored"] += 1
+
+
 def handle_upload(up, name_in, cat_in, keys):
     cn = counters()
     data = up.getvalue()
@@ -477,15 +489,28 @@ def handle_upload(up, name_in, cat_in, keys):
         st.info("Shift screenshot se pakki nahi hui aur score " + str(board.MIN_MANUAL_SCORE) + " se kam hai, isliye ye result rank mein nahi judega.")
     else:
         src = "manual" if manual else "auto"
+        id_ok = board.valid_id(cand_id)
+        if not id_ok:
+            src = "unverified"
         sig = shift + "|" + img_id
         saved = st.session_state.setdefault("saved", {})
         if sig not in saved:
             saved[sig] = save_result(ocr_name or name, cand_id, shift, r, img_id, cat, src)
             if saved[sig] == "ok":
                 cn["saved"] += 1
+                if not id_ok:
+                    cn["unverified"] += 1
+                if (not id_ok) or manual or (r["wrong"] == 0 and r["correct"] >= 90):
+                    keep_proof(img, img_id)
             elif saved[sig] == "error":
                 cn["failed_saves"] += 1
-        own = board.make_record(ocr_name or name, cand_id, shift, r["score"], cat, img_id, src)
+        if id_ok:
+            own = board.make_record(ocr_name or name, cand_id, shift, r["score"], cat, img_id, src)
+        else:
+            st.warning(
+                "Screenshot mein Candidate ID saaf nahi padhi gayi, isliye ye result rank mein nahi joda gaya. "
+                "Poora aur saaf screenshot dobara upload karein. Verification ke liye ye image kuch din rakhi ja sakti hai."
+            )
 
     rk = None
     if own is not None:
@@ -594,13 +619,48 @@ with tab_a:
                 st.caption(
                     "App chalu hone ke baad: uploads " + str(cn["uploads"]) + ", valid OMR nahi " + str(cn["invalid"])
                     + ", save hue " + str(cn["saved"]) + ", save fail " + str(cn["failed_saves"])
-                    + ", manual shift (40 se kam) " + str(cn["manual_skipped"]) + "."
+                    + ", manual shift (40 se kam) " + str(cn["manual_skipped"]) + ", bina ID " + str(cn["unverified"]) + ", image rakhi " + str(cn["stored"]) + "."
                 )
                 body = board.body_rows(adata["rows"])
                 width = len(board.HEADER)
                 padded = [(list(r) + [""] * width)[:width] for r in body]
                 csv = pd.DataFrame(padded, columns=board.HEADER).to_csv(index=False).encode("utf-8-sig")
                 st.download_button("Poora data (CSV)", data=csv, file_name="omr_results.csv", mime="text/csv", key="adm_csv")
+
+            st.divider()
+            st.write("**Shak wale results (review)**")
+            sus = board.suspects(adata["rows"]) if adata is not None else []
+            if not sus:
+                st.caption("Abhi koi shak wali entry nahi hai.")
+            else:
+                st.caption(str(len(sus)) + " entries. 'Rank mein judein' ya 'Hatayein' dabate hi ye list se hat jayengi.")
+                st.dataframe(pd.DataFrame(sus)[["row_no", "name", "cid", "shift", "score", "src", "why", "img"]], hide_index=True)
+                pick_sus = st.selectbox("Entry (Image ID)", [x["img"] or ("row " + str(x["row_no"])) for x in sus], key="sus_pick")
+                chosen = next((x for x in sus if (x["img"] or ("row " + str(x["row_no"]))) == pick_sus), None)
+                surl, skey = get_secret("SUPABASE_URL"), get_secret("SUPABASE_KEY")
+                if chosen and chosen["img"] and surl and skey:
+                    pic = store.fetch(surl, skey, chosen["img"])
+                    if pic:
+                        st.image(pic)
+                    else:
+                        st.caption("Is entry ki image store mein nahi mili (purani ho sakti hai).")
+                a1, a2 = st.columns(2)
+                for btn, label, newsrc in ((a1, "Rank mein judein", "approved"), (a2, "Hatayein (rank se)", "rejected")):
+                    if btn.button(label, key="sus_" + newsrc) and chosen:
+                        try:
+                            wsx = get_ws()
+                            board.with_retry(lambda: wsx.update(values=[[newsrc]], range_name="K" + str(chosen["row_no"])))
+                            sheet_data.clear()
+                            st.success("Ho gaya: row " + str(chosen["row_no"]) + " -> " + newsrc + ". Page refresh karein.")
+                        except Exception as e:
+                            st.error("Update nahi ho paya: " + type(e).__name__)
+            surl2, skey2 = get_secret("SUPABASE_URL"), get_secret("SUPABASE_KEY")
+            if surl2 and skey2:
+                if st.button("30 din se purani images hatayein"):
+                    dr = store.delete_old(surl2, skey2, 30)
+                    st.info("Storage tak nahi pahunch paya." if dr is None else str(dr[0]) + " images hata di (kul " + str(dr[1]) + " mein se).")
+            else:
+                st.caption("Image storage chalu nahi hai (Secrets mein SUPABASE_URL aur SUPABASE_KEY nahi mili).")
 
             st.divider()
             st.write("**PDF se Answer Key**")

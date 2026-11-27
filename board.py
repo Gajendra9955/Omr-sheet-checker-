@@ -44,6 +44,41 @@ def make_record(name, cid, shift, score, cat, img, src, i=10 ** 9):
     }
 
 
+def valid_id(cid):
+    return len("".join(ch for ch in str(cid) if ch.isdigit())) >= 6
+
+
+def counted(cid, src):
+    """Rank mein tabhi gini jati hai jab ID saaf padhi gayi ho (ya admin ne pakka kiya ho)."""
+    if src in ("unverified", "rejected"):
+        return False
+    return src == "approved" or valid_id(cid)
+
+
+def suspects(rows):
+    """Admin ke dekhne layak rows: bina ID, khud chuni shift, ya 0 galat ke saath 90+ sahi. Admin ne jinhe dekh liya unhe chhodkar."""
+    out = []
+    for n, row in enumerate(rows):
+        row = [str(c) for c in row] + [""] * 11
+        src = row[10].strip().lower() or "auto"
+        if src in ("approved", "rejected") or row[0].strip() == HEADER[0]:
+            continue
+        why = []
+        if not valid_id(row[2]):
+            why.append("ID nahi padhi")
+        if src == "manual":
+            why.append("shift khud chuni")
+        try:
+            if int(row[6]) == 0 and int(row[5]) >= 90:
+                why.append("0 galat, 90+ sahi")
+        except ValueError:
+            pass
+        if why:
+            out.append({"row_no": n + 1, "ts": row[0], "name": row[1], "cid": row[2], "shift": row[3],
+                        "score": row[4], "img": row[8].strip(), "src": src, "why": ", ".join(why)})
+    return out
+
+
 def parse_rows(rows):
     """Sheet ki rows -> records ki list. Kharab rows chhod di jati hain."""
     recs = []
@@ -56,6 +91,9 @@ def parse_rows(rows):
         except ValueError:
             continue
         if not row[3].strip():
+            continue
+        src_ = (row[10].strip().lower() if len(row) > 10 else "") or "auto"
+        if not counted(row[2], src_):
             continue
         rec = make_record(
             row[1], row[2], row[3], score,
