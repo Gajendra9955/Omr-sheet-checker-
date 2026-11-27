@@ -1,5 +1,5 @@
 # =====================================================================
-# OMR Result Checker
+# OMR Result Checker created by Gajendra verma
 #   - OMR screenshot ya ZIP upload -> score, rank (same exam ke beech), scorecard download
 #   - Google Sheet mein result save, dashboard mein sirf masked ID aur marks
 #   - Admin panel (?admin=1): answer key, alias, dashboard, data download
