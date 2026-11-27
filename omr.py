@@ -202,6 +202,96 @@ def scan(data):
     return res, len(blobs)
 
 
+# ---------------------------------------------------------------- valid OMR jaanch
+MAX_FILE = 10 * 1024 * 1024        # upload ki limit
+MAX_ZIP_IMG = 12 * 1024 * 1024     # ZIP ke andar ki ek image ki limit
+MAX_ZIP_TOTAL = 25 * 1024 * 1024   # ZIP ke andar ki sab images milakar
+MAX_ZIP_ENTRIES = 20
+RATIO_MIN, RATIO_MAX = 0.172, 0.202   # OMR screenshot ki chaudai/lambai (asli: 0.187)
+_GX = np.array([69, 111, 153, 195, 330, 372, 414, 456], float)
+_GY = 142 + 42.17 * np.arange(55)
+_GP = np.array([(x, y) for y in _GY for x in _GX])      # 440 bubbles (110 sawaal x 4)
+_GA = np.linspace(0, 2 * np.pi, 32, endpoint=False)
+_GR = np.arange(0, 23, 1.0)
+_GDX = _GR[:, None] * np.cos(_GA)[None, :]
+_GDY = _GR[:, None] * np.sin(_GA)[None, :]
+
+
+def is_zip(data):
+    return data[:2] == b"PK"
+
+
+def images_from_zip(data):
+    """ZIP ke andar ki images (bytes ki list). Disk par kuch nahi likhta. Galat ya bhari ZIP par [] deta hai."""
+    import io
+    import zipfile
+
+    out = []
+    try:
+        if len(data) > MAX_FILE:
+            return out
+        z = zipfile.ZipFile(io.BytesIO(data))
+        total = 0
+        for zi in z.infolist()[:MAX_ZIP_ENTRIES]:
+            if zi.is_dir() or (zi.flag_bits & 0x1):
+                continue
+            if not zi.filename.lower().endswith((".jpg", ".jpeg", ".png")):
+                continue
+            if zi.file_size > MAX_ZIP_IMG:
+                continue
+            total += zi.file_size
+            if total > MAX_ZIP_TOTAL:
+                break
+            with z.open(zi) as f:
+                b = f.read(MAX_ZIP_IMG + 1)
+            if len(b) <= MAX_ZIP_IMG:
+                out.append(b)
+    except Exception:
+        return []
+    return out
+
+
+def validate_omr(data):
+    """Kya ye Station Master / GTM jaisi OMR sheet ka screenshot hai? Returns (ok, kaaran)."""
+    try:
+        import io
+        from PIL import Image
+
+        im = Image.open(io.BytesIO(data))
+        w, h = im.size
+        fmt = im.format
+    except Exception:
+        return False, "image nahi hai"
+    if fmt not in ("JPEG", "PNG", "MPO"):
+        return False, "format"
+    if w < 280 or w > 4000 or h > 20000 or w * h > 30_000_000:
+        return False, "size"
+    if not (RATIO_MIN <= w / h <= RATIO_MAX):
+        return False, "shape"
+    try:
+        img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            return False, "decode"
+        hh, ww = img.shape[:2]
+        s = ww / 482.0
+        g = img[:, :, 1].astype(np.float32)
+        xs = np.clip(np.rint((_GP[:, 0, None, None] + _GDX[None]) * s).astype(int), 0, ww - 1)
+        ys = np.clip(np.rint((_GP[:, 1, None, None] + _GDY[None]) * s).astype(int), 0, hh - 1)
+        prof = g[ys, xs].mean(axis=2)
+        inner = prof[:, 8:14].mean(axis=1)
+        ring = prof[:, 15:19].min(axis=1)
+        empty = (inner > 150) & (ring < inner - 25)
+        filled = (prof[:, 6:14].mean(axis=1) < 90) & ~empty
+        n_empty = int(empty.sum())
+        n_all = n_empty + int(filled.sum())
+    except Exception:
+        return False, "decode"
+    total = len(_GP)
+    if n_all >= 0.85 * total and n_empty >= 0.6 * total:
+        return True, ""
+    return False, "pattern"
+
+
 def evaluate(res, key, pos=1.0, neg=1.0 / 3):
     """res = scan() ka output, key = 110 letters ('*' = dropped question, sabko marks)."""
     rows = []

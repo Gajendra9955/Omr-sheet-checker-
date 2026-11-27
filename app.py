@@ -1,28 +1,25 @@
 # =====================================================================
-# OMR Result Checker + Google Sheet saving
+# OMR Result Checker
+#   - OMR screenshot ya ZIP upload -> score, rank (same exam ke beech), scorecard download
+#   - Google Sheet mein result save, dashboard mein sirf masked ID aur marks
+#   - Admin panel (?admin=1): answer key, alias, dashboard, data download
 #
-# SETUP (do secrets chahiye, dono Streamlit Cloud ya Hugging Face mein same naam se):
-#   1. GCP_SERVICE_ACCOUNT_JSON = Google Cloud se download ki hui JSON key ka POORA text
-#   2. SHEET_URL                = Google Sheet ka poora link
-#   3. ADMIN_PASSWORD           = Admin panel ka password
+# FILES (sab ek hi folder mein): app.py, omr.py, board.py, keys.json,
+#                                requirements.txt, packages.txt, README.md
 #
-# Streamlit Cloud: App > Settings > Secrets mein ye format:
-#   ADMIN_PASSWORD = "aapka-password"
-#   SHEET_URL = "https://docs.google.com/spreadsheets/d/XXXX/edit"
-#   GCP_SERVICE_ACCOUNT_JSON = '''
-#   { ...JSON file ka poora text yahan paste karein... }
-#   '''
-#
-# Hugging Face: Settings > Variables and secrets mein teeno ko alag-alag
-# Secret banayein (value mein JSON ka poora text paste karein).
-#
-# Google Sheet ko service account ke email (JSON mein "client_email")
-# ke saath Editor access ke sath Share karna zaroori hai.
+# SECRETS (Streamlit Cloud: App > Settings > Secrets / Hugging Face: Variables and secrets):
+#   ADMIN_PASSWORD           = "aapka-password"
+#   SHEET_URL                = "https://docs.google.com/spreadsheets/d/XXXX/edit"
+#   GCP_SERVICE_ACCOUNT_JSON = '''{ ...JSON key ka poora text... }'''
+# Google Sheet ko service account ke email (JSON mein "client_email") ke saath
+# Editor access se Share karna zaroori hai.
 # =====================================================================
 import os
+import io
 import json
 import hmac
 import hashlib
+import textwrap
 from datetime import datetime, timezone, timedelta
 
 import pandas as pd
@@ -33,7 +30,8 @@ try:
 except ImportError:
     gspread = None
 
-from omr import scan, evaluate, read_header, pick_shift
+import board
+from omr import scan, evaluate, read_header, pick_shift, validate_omr, images_from_zip, is_zip, MAX_FILE
 
 st.set_page_config(page_title="OMR Result Checker", page_icon="📝", layout="centered")
 
@@ -41,9 +39,12 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 KEYFILE = os.path.join(BASE, "keys.json")
 ADMIN_PASSWORD = os.environ.get("ADMIN_PASSWORD", "")
 IST = timezone(timedelta(hours=5, minutes=30))
-HEADER = ["Date/Time", "Name", "Candidate ID", "Shift", "Score", "Correct", "Wrong", "Unattempted", "Image ID"]
+PLACEHOLDER_CAT = "-- Category chunein --"
+PLACEHOLDER_SHIFT = "-- Shift chunein --"
+NOTICE = "Rank ke liye aapka naam, ID, category aur score save hote hain. Dashboard mein sirf masked ID aur marks dikhte hain."
 
 
+# ------------------------------------------------------------ secrets, Sheet
 def get_secret(name):
     v = os.environ.get(name, "")
     if v:
@@ -65,71 +66,70 @@ def get_ws():
     return gc.open_by_url(url).sheet1
 
 
-def body_rows(rows):
-    """Header wali pehli row hatata hai. Header na ho to saari rows data mani jati hain."""
-    if rows and rows[0] and rows[0][0].strip() == HEADER[0]:
-        return rows[1:]
-    return rows
+@st.cache_resource
+def counters():
+    """Admin ke liye ginti (app restart hone par zero ho jati hai)."""
+    return {"uploads": 0, "invalid": 0, "saved": 0, "failed_saves": 0, "manual_skipped": 0}
 
 
-def save_result(name, cand_id, shift, r, img_id):
+def once(tag):
+    """Har screenshot ke liye ginti sirf ek baar (page dobara chalne par nahi)."""
+    seen = st.session_state.setdefault("seen", set())
+    if tag in seen:
+        return False
+    seen.add(tag)
+    return True
+
+
+@st.cache_resource(ttl=60, show_spinner=False)
+def sheet_data():
+    """Saare candidates ki Sheet, 1 minute ke liye yaad (sab candidates ke liye ek hi baar padhi jati hai)."""
+    ws = get_ws()
+    if ws is None:
+        raise RuntimeError("Sheet connect nahi hai")
+    rows = board.with_retry(lambda: ws.get_all_values())
+    recs = board.parse_rows(board.body_rows(rows))
+    return {"rows": rows, "recs": recs, "groups": board.build_groups(recs)}
+
+
+def get_data():
+    try:
+        return sheet_data()
+    except Exception:
+        return None
+
+
+def save_result(name, cand_id, shift, r, img_id, cat, src):
     """Returns: ok / dup / nocfg / error"""
     try:
         ws = get_ws()
         if ws is None:
             return "nocfg"
-        rows = ws.get_all_values()
+        data = get_data()
+        rows = data["rows"] if data is not None else board.with_retry(lambda: ws.get_all_values())
         if not rows:
-            ws.append_row(HEADER, value_input_option="RAW")
-        for row in body_rows(rows):
-            if len(row) > 3 and row[3] == shift:
-                if cand_id and row[2] == cand_id:
+            board.with_retry(lambda: ws.append_row(board.HEADER, value_input_option="RAW"))
+        elif str(rows[0][0]).strip() == board.HEADER[0] and len(rows[0]) < len(board.HEADER):
+            first = chr(65 + len(rows[0]))
+            last = chr(64 + len(board.HEADER))
+            extra = board.HEADER[len(rows[0]):]
+            board.with_retry(lambda: ws.update(values=[extra], range_name=first + "1:" + last + "1"))
+        for row in board.body_rows(rows):
+            if len(row) > 3 and row[3].strip() == shift:
+                rid = "".join(ch for ch in row[2] if ch.isdigit())
+                if cand_id and rid == cand_id:
                     return "dup"
-                if len(row) > 8 and row[8] == img_id:
+                if len(row) > 8 and row[8].strip() == img_id:
                     return "dup"
         now = datetime.now(IST).strftime("%d-%m-%Y %H:%M:%S")
-        ws.append_row(
-            [now, name, cand_id, shift, r["score"], r["correct"], r["wrong"], r["unattempted"], img_id],
-            value_input_option="RAW",
-        )
+        line = [now, name, cand_id, shift, r["score"], r["correct"], r["wrong"], r["unattempted"], img_id, cat, src]
+        board.with_retry(lambda: ws.append_row(line, value_input_option="RAW"))
         return "ok"
     except Exception:
         return "error"
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def get_rank(shift, score):
-    """Sheet ke scores se is shift mein rank. Returns (rank, total) ya None."""
-    try:
-        ws = get_ws()
-        if ws is None:
-            return None
-        mine = []
-        allsc = []
-        for row in body_rows(ws.get_all_values()):
-            if len(row) > 4:
-                try:
-                    v = float(row[4].replace(",", "."))
-                except ValueError:
-                    continue
-                allsc.append(v)
-                if row[3] == shift:
-                    mine.append(v)
-        if not mine:
-            return None
-        return (
-            (1 + sum(1 for s in mine if s > score + 1e-9), len(mine)),
-            (1 + sum(1 for s in allsc if s > score + 1e-9), len(allsc)),
-        )
-    except Exception:
-        return None
-
-
-@st.cache_data(show_spinner="Screenshot se naam aur shift padh rahe hain...")
-def cached_header(data):
-    return read_header(data)
-
-
+# ------------------------------------------------------------ answer keys
 def load_file_keys():
     """keys.json (GitHub wali default keys)."""
     try:
@@ -163,6 +163,12 @@ def keys_sheet(create=False):
         return kws
 
 
+def split_aliases(txt):
+    """'a, b; c' -> ['a', 'b', 'c']"""
+    parts = txt.replace(";", ",").replace("|", ",").replace("\n", ",").split(",")
+    return [p.strip() for p in parts if p.strip()]
+
+
 @st.cache_data(ttl=60, show_spinner=False)
 def sheet_keys():
     """Sheet ke 'Keys' tab ki saari keys (1 minute ke liye yaad rakhi jati hain)."""
@@ -171,7 +177,7 @@ def sheet_keys():
         kws = keys_sheet()
         if kws is None:
             return out
-        rows_k = kws.get_all_values()
+        rows_k = board.with_retry(lambda: kws.get_all_values())
         if rows_k and rows_k[0] and rows_k[0][0].strip().lower() == "shift":
             rows_k = rows_k[1:]
         for row in rows_k:
@@ -190,12 +196,6 @@ def sheet_keys():
     except Exception:
         return {}
     return out
-
-
-def split_aliases(txt):
-    """'a, b; c' -> ['a', 'b', 'c']"""
-    parts = txt.replace(";", ",").replace("|", ",").replace("\n", ",").split(",")
-    return [p.strip() for p in parts if p.strip()]
 
 
 def load_keys():
@@ -223,13 +223,13 @@ def save_key_sheet(name, k, pos, neg, aliases=""):
         if kws.col_count < 5:
             kws.resize(cols=5)
             kws.update(values=[["Aliases"]], range_name="E1")
-        names = kws.col_values(1)
+        names = board.with_retry(lambda: kws.col_values(1))
         row = [name, k, pos, neg, aliases]
         if name in names:
             i = names.index(name) + 1
-            kws.update(values=[row], range_name="A" + str(i) + ":E" + str(i))
+            board.with_retry(lambda: kws.update(values=[row], range_name="A" + str(i) + ":E" + str(i)))
         else:
-            kws.append_row(row, value_input_option="RAW")
+            board.with_retry(lambda: kws.append_row(row, value_input_option="RAW"))
         sheet_keys.clear()
         return True
     except Exception:
@@ -242,10 +242,10 @@ def delete_key_sheet(name):
         kws = keys_sheet()
         if kws is None:
             return False
-        names = kws.col_values(1)
+        names = board.with_retry(lambda: kws.col_values(1))
         if name not in names:
             return False
-        kws.delete_rows(names.index(name) + 1)
+        board.with_retry(lambda: kws.delete_rows(names.index(name) + 1))
         sheet_keys.clear()
         return True
     except Exception:
@@ -254,6 +254,278 @@ def delete_key_sheet(name):
 
 def clean_key(txt):
     return "".join(txt.upper().replace(",", " ").split())
+
+
+# ------------------------------------------------------------ image, scan (yaad rakhe jate hain)
+@st.cache_data(show_spinner=False, max_entries=20)
+def prepare_image(data):
+    """(OMR image ke bytes, kaaran). ZIP ho to usme se pehli valid OMR image."""
+    if len(data) > MAX_FILE:
+        return None, "big"
+    cands = images_from_zip(data) if is_zip(data) else [data]
+    for b in cands:
+        if validate_omr(b)[0]:
+            return b, ""
+    return None, "invalid"
+
+
+@st.cache_data(show_spinner=False, max_entries=30)
+def cached_scan(img):
+    return scan(img)
+
+
+@st.cache_data(show_spinner="Screenshot se naam aur shift padh rahe hain...", max_entries=30)
+def cached_header(img):
+    return read_header(img)
+
+
+# ------------------------------------------------------------ scorecard
+def make_scorecard(name, cid, shift, cat, r, rk):
+    """Scorecard ki PNG image (bytes)."""
+    from PIL import Image, ImageDraw, ImageFont
+
+    def font(size, bold=False):
+        try:
+            return ImageFont.truetype("DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf", size)
+        except Exception:
+            try:
+                return ImageFont.load_default(size=size)
+            except TypeError:
+                return ImageFont.load_default()
+
+    W, H = 720, 980
+    img = Image.new("RGB", (W, H), "white")
+    d = ImageDraw.Draw(img)
+    d.rectangle([0, 0, W, 110], fill=(233, 30, 99))
+    d.text((36, 30), "OMR SCORECARD", fill="white", font=font(46, True))
+    y = 140
+    d.text((36, y), str(name), fill="black", font=font(36, True))
+    y += 56
+    if cid:
+        d.text((36, y), "Candidate ID: " + str(cid), fill=(60, 60, 60), font=font(26))
+        y += 40
+    for line in textwrap.wrap(str(shift), 38):
+        d.text((36, y), line, fill=(60, 60, 60), font=font(26))
+        y += 36
+    if cat:
+        d.text((36, y), "Category: " + cat, fill=(60, 60, 60), font=font(26))
+        y += 40
+    y += 20
+    d.rounded_rectangle([36, y, W - 36, y + 150], radius=18, fill=(252, 228, 236))
+    d.text((60, y + 18), "SCORE", fill=(120, 20, 60), font=font(24, True))
+    d.text((60, y + 54), str(r["score"]) + " / " + str(r["total"]), fill=(120, 20, 60), font=font(64, True))
+    y += 190
+    bw = (W - 72 - 40) // 3
+    for n, (lab, val, col) in enumerate((("Correct", r["correct"], (46, 125, 50)), ("Wrong", r["wrong"], (198, 40, 40)), ("Unattempted", r["unattempted"], (90, 90, 90)))):
+        x = 36 + n * (bw + 20)
+        d.rounded_rectangle([x, y, x + bw, y + 110], radius=14, outline=col, width=3)
+        d.text((x + 16, y + 12), lab, fill=col, font=font(22, True))
+        d.text((x + 16, y + 48), str(val), fill=col, font=font(44, True))
+    y += 150
+    if rk:
+        d.text((36, y), "RANK", fill="black", font=font(26, True))
+        y += 42
+        lines = [("In my shift", rk.get("shift")), ("In my shift (" + cat + ")", rk.get("shift_cat")),
+                 ("In whole exam", rk.get("exam")), ("In whole exam (" + cat + ")", rk.get("exam_cat"))]
+        for lab, v in lines:
+            if v:
+                d.text((36, y), lab + ": " + str(v[0]) + " / " + str(v[1]), fill=(40, 40, 40), font=font(28))
+                y += 42
+    d.text((36, H - 70), "Unofficial estimate from the answer key. Rank is among users of this site only.", fill=(120, 120, 120), font=font(16))
+    d.text((36, H - 42), datetime.now(IST).strftime("%d-%m-%Y %H:%M"), fill=(120, 120, 120), font=font(16))
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+# ------------------------------------------------------------ rank aur dashboard
+def fmt_rank(v):
+    return (str(v[0]) + " / " + str(v[1])) if v else "-"
+
+
+def board_df(rows):
+    return pd.DataFrame({
+        "Rank": [r["rank"] for r in rows],
+        "ID": [r["id"] for r in rows],
+        "Marks": [round(r["marks"], 2) for r in rows],
+        "Aap": ["◀ Aap" if r["own"] else "" for r in rows],
+    })
+
+
+def show_df(df):
+    try:
+        sty = df.style.apply(lambda row: ["background-color: #ffe08a; color: #000000" if row["Aap"] else ""] * len(row), axis=1)
+        st.dataframe(sty, hide_index=True, use_container_width=True)
+    except Exception:
+        st.dataframe(df, hide_index=True, use_container_width=True)
+
+
+def show_ranks(groups, own, uid):
+    """Rank ke chaar dabbe aur dashboard (Meri shift / Sabhi shifts)."""
+    rk = board.ranks_for(groups, own)
+    cat = own["cat"]
+    a, b = st.columns(2)
+    a.metric("Meri shift: overall", fmt_rank(rk["shift"]))
+    b.metric("Meri shift: " + (cat or "category"), fmt_rank(rk["shift_cat"]))
+    c, d = st.columns(2)
+    c.metric("Poora exam: overall", fmt_rank(rk["exam"]))
+    d.metric("Poora exam: " + (cat or "category"), fmt_rank(rk["exam_cat"]))
+    st.caption("Rank sirf un candidates ke beech hai jinhone is website par result nikala hai, aur sirf same exam ke beech. Ye asli rank nahi hai.")
+    st.subheader("Dashboard")
+    tab_s, tab_e = st.tabs(["Meri shift", "Sabhi shifts (" + own["exam"].title() + ")"])
+    for tab, level in ((tab_s, "shift"), (tab_e, "exam")):
+        with tab:
+            opts = ["Overall"] + (["Meri category (" + cat + ")"] if cat else [])
+            view = st.radio("Dikhayein", opts, horizontal=True, key=uid + level + "_view")
+            ents = board.entries_for(groups, level, own)
+            if view != "Overall":
+                ents = board.only_cat(ents, cat)
+            rows = board.table(ents, own["key"])
+            own_idx = next((n for n, r in enumerate(rows) if r["own"]), 0)
+            st.caption("Aap rank " + str(rows[own_idx]["rank"]) + " par hain. Kul " + str(len(rows)) + " log. Aapke upar " + str(own_idx) + " log hain.")
+            win, _, _ = board.window(rows)
+            show_df(board_df(win))
+            if st.checkbox("Poori list dekhein", key=uid + level + "_full"):
+                per = 100
+                pages = max(1, -(-len(rows) // per))
+                pg = st.number_input("Page (" + str(pages) + " mein se)", min_value=1, max_value=pages,
+                                     value=own_idx // per + 1, step=1, key=uid + level + "_page")
+                lo = (int(pg) - 1) * per
+                show_df(board_df(rows[lo:lo + per]))
+    return rk
+
+
+# ------------------------------------------------------------ candidate screen
+def handle_upload(up, name_in, cat_in, keys):
+    cn = counters()
+    data = up.getvalue()
+    img_id = hashlib.md5(data).hexdigest()[:12]
+    first_time = once("up|" + img_id)
+    if first_time:
+        cn["uploads"] += 1
+
+    img, why = prepare_image(data)
+    if img is None:
+        if first_time:
+            cn["invalid"] += 1
+        if why == "big":
+            st.error("File bahut badi hai. 10 MB se chhoti file upload karein.")
+        else:
+            st.error("Please upload valid OMR sheet.")
+            st.caption("Q1 se Q110 tak poori OMR sheet ka screenshot (ya uski ZIP file) hi upload karein.")
+        return
+
+    res, cnt = cached_scan(img)
+    hd = cached_header(img)
+    cand_id = hd["cand_id"]
+    ocr_name = hd["name"]
+    name = ocr_name or name_in
+    img_id = hashlib.md5(img).hexdigest()[:12]
+
+    shift = pick_shift(hd, list(keys.keys()), alias_map(keys))
+    manual = False
+    if shift is None:
+        manual = True
+        seen = hd.get("shift_text", "")
+        if seen:
+            st.caption("Screenshot par ye padha gaya: " + seen)
+        pick = st.selectbox(
+            "Shift chunein (screenshot se apne aap nahi padhi gayi)",
+            [PLACEHOLDER_SHIFT] + list(keys.keys()),
+            key="manual_shift",
+        )
+        shift = None if pick == PLACEHOLDER_SHIFT else pick
+
+    missing = []
+    if cat_in == PLACEHOLDER_CAT:
+        missing.append("category chunein")
+    if not name:
+        missing.append("naam bharein")
+    if shift is None:
+        missing.append("shift chunein")
+    if missing:
+        st.info("Result dekhne ke liye apni " + " aur ".join(missing) + ".")
+        return
+    cat = cat_in
+
+    cfg = keys[shift]
+    r = evaluate(res, cfg["key"], float(cfg.get("pos", 1)), float(cfg.get("neg", 1 / 3)))
+    with st.expander("Uploaded image dekhein"):
+        st.image(img)
+    st.subheader("Result")
+    st.write("**" + name + "**" + ((" | ID: " + cand_id) if cand_id else "") + " | " + cat)
+    st.caption(shift + (" (aapne khud chuni)" if manual else ""))
+    c1, c2 = st.columns(2)
+    c1.metric("Correct", r["correct"])
+    c2.metric("Wrong", r["wrong"])
+    c3, c4 = st.columns(2)
+    c3.metric("Unattempted", r["unattempted"])
+    c4.metric("Score", str(r["score"]) + " / " + str(r["total"]))
+    st.caption("Marking: +" + str(cfg.get("pos", 1)) + " sahi, -" + str(round(float(cfg.get("neg", 1 / 3)), 4)) + " galat")
+
+    # Sheet mein save: har result ek hi baar
+    own = None
+    if cnt < 40 or cnt > 150:
+        st.warning(
+            "Sirf " + str(cnt) + " bhare bubbles mile. Poori OMR sheet (Q1 se Q110 tak) ka screenshot upload karein. "
+            "Ye result Sheet mein save nahi kiya gaya."
+        )
+    elif manual and r["score"] <= board.MIN_MANUAL_SCORE:
+        if once("skip|" + img_id):
+            cn["manual_skipped"] += 1
+        st.info("Shift screenshot se pakki nahi hui aur score " + str(board.MIN_MANUAL_SCORE) + " se kam hai, isliye ye result rank mein nahi judega.")
+    else:
+        src = "manual" if manual else "auto"
+        sig = shift + "|" + img_id
+        saved = st.session_state.setdefault("saved", {})
+        if sig not in saved:
+            saved[sig] = save_result(ocr_name or name, cand_id, shift, r, img_id, cat, src)
+            if saved[sig] == "ok":
+                cn["saved"] += 1
+            elif saved[sig] == "error":
+                cn["failed_saves"] += 1
+        own = board.make_record(ocr_name or name, cand_id, shift, r["score"], cat, img_id, src)
+
+    rk = None
+    if own is not None:
+        data_all = get_data()
+        if data_all is not None:
+            rk = show_ranks(data_all["groups"], own, "res_")
+        else:
+            st.caption("Rank abhi load nahi ho paya. Thodi der baad page dobara kholein.")
+
+    df = pd.DataFrame(r["rows"])
+    try:
+        png = make_scorecard(name, cand_id, shift, cat, r, rk)
+        d1, d2 = st.columns(2)
+        d1.download_button("Scorecard (PNG)", data=png, file_name="scorecard.png", mime="image/png", key="dl_png")
+        d2.download_button("Sawaal-wise (CSV)", data=df.to_csv(index=False).encode("utf-8-sig"),
+                           file_name="answers.csv", mime="text/csv", key="dl_csv")
+    except Exception:
+        pass
+    wrong = df[df["Status"] == "Wrong"]
+    if len(wrong) > 0:
+        st.write("**Galat answers:**")
+        st.dataframe(wrong, hide_index=True)
+    with st.expander("Saare 110 questions ka breakdown"):
+        st.dataframe(df, hide_index=True)
+
+
+def lookup_box():
+    with st.expander("Sirf rank dekhna hai? Candidate ID daalein"):
+        cid_in = st.text_input("Candidate ID", max_chars=12, key="lookup_id").strip()
+        if not cid_in:
+            return
+        data_all = get_data()
+        if data_all is None:
+            st.warning("Abhi rank load nahi ho paya. Thodi der baad try karein.")
+            return
+        rec = board.pick_by_id(data_all["recs"], cid_in)
+        if rec is None:
+            st.info("Is ID ka result abhi nahi mila. Pehle apni OMR sheet upload karein.")
+            return
+        st.write("**ID: " + board.mask_id(rec["cid"]) + "** | " + rec["shift"] + " | Marks: " + str(rec["score"]))
+        show_ranks(data_all["groups"], rec, "lk_")
 
 
 st.title("📝 OMR Result Checker")
@@ -270,82 +542,13 @@ with tab_c:
     if not keys:
         st.warning("Abhi koi Answer Key available nahi hai. Admin se key add karwayein.")
     else:
-        up = st.file_uploader("Apni OMR sheet (screenshot) upload karein", type=["png", "jpg", "jpeg"])
+        name_in = st.text_input("Aapka naam", max_chars=80).strip()
+        cat_in = st.selectbox("Category", [PLACEHOLDER_CAT] + board.CATEGORIES)
+        up = st.file_uploader("Apni OMR sheet upload karein (screenshot ya ZIP)", type=["png", "jpg", "jpeg", "zip"])
+        st.caption(NOTICE)
         if up is not None:
-            data = up.getvalue()
-            res, cnt = scan(data)
-            if res is None:
-                st.error("Image padh nahi payi. Dusri image try karein.")
-            else:
-                # Naam, ID aur shift screenshot ki upar wali patti se apne aap padhe jate hain
-                hd = cached_header(data)
-                name = hd["name"]
-                cand_id = hd["cand_id"]
-                shift = pick_shift(hd, list(keys.keys()), alias_map(keys))
-                if shift is None:
-                    seen = hd.get("shift_text", "")
-                    if seen:
-                        st.caption("Screenshot par ye padha gaya: " + seen)
-                    pick = st.selectbox(
-                        "Shift chunein (screenshot se apne aap nahi padhi gayi)",
-                        ["-- Shift chunein --"] + list(keys.keys()),
-                    )
-                    shift = None if pick == "-- Shift chunein --" else pick
-                if not name:
-                    name = st.text_input("Aapka Naam (screenshot se nahi padha gaya)", max_chars=80).strip()
-                if not name:
-                    st.info("Result dekhne ke liye apna Naam bharein.")
-                elif shift is None:
-                    st.info("Result dekhne ke liye apni Shift chunein.")
-                else:
-                    with st.expander("Uploaded image dekhein"):
-                        st.image(data)
-                    if cnt < 40 or cnt > 150:
-                        st.warning(
-                            "Sirf " + str(cnt) + " bhare bubbles mile. Poori OMR sheet ka screenshot "
-                            "(Q1 se Q110 tak) upload karein. Ye result Sheet mein save nahi kiya gaya."
-                        )
-                    cfg = keys[shift]
-                    r = evaluate(res, cfg["key"], float(cfg.get("pos", 1)), float(cfg.get("neg", 1 / 3)))
-                    st.subheader("Result")
-                    st.write("**" + name + "**" + ((" | ID: " + cand_id) if cand_id else ""))
-                    st.caption(shift)
-                    c1, c2 = st.columns(2)
-                    c1.metric("Correct", r["correct"])
-                    c2.metric("Wrong", r["wrong"])
-                    c3, c4 = st.columns(2)
-                    c3.metric("Unattempted", r["unattempted"])
-                    c4.metric("Score", str(r["score"]) + " / " + str(r["total"]))
-                    st.caption(
-                        "Marking: +" + str(cfg.get("pos", 1)) + " sahi, -" + str(round(float(cfg.get("neg", 1 / 3)), 4)) + " galat"
-                    )
-
-                    # Google Sheet mein save (har result ek hi baar)
-                    if "saved" not in st.session_state:
-                        st.session_state["saved"] = {}
-                    img_id = hashlib.md5(data).hexdigest()[:12]
-                    sig = shift + "|" + img_id
-                    if cnt < 40 or cnt > 150:
-                        status = "skip"
-                    else:
-                        if sig not in st.session_state["saved"]:
-                            st.session_state["saved"][sig] = save_result(name, cand_id, shift, r, img_id)
-                        status = st.session_state["saved"][sig]
-                    if status in ("ok", "dup"):
-                        rr = get_rank(shift, r["score"])
-                        if rr:
-                            c5, c6 = st.columns(2)
-                            c5.metric("Rank (is shift mein)", str(rr[0][0]) + " / " + str(rr[0][1]))
-                            c6.metric("Rank (sabhi shifts mein)", str(rr[1][0]) + " / " + str(rr[1][1]))
-                            st.caption("Ye rank sirf un candidates ke beech hai jinhone is website par result nikala hai.")
-
-                    df = pd.DataFrame(r["rows"])
-                    wrong = df[df["Status"] == "Wrong"]
-                    if len(wrong) > 0:
-                        st.write("**Galat answers:**")
-                        st.dataframe(wrong, hide_index=True)
-                    with st.expander("Saare 110 questions ka breakdown"):
-                        st.dataframe(df, hide_index=True)
+            handle_upload(up, name_in, cat_in, keys)
+        lookup_box()
 
 # --------------------------------------------------------------------- Admin
 if not is_admin:
@@ -367,7 +570,39 @@ with tab_a:
                         st.success("Connected: " + ws.spreadsheet.title)
                 except Exception as e:
                     st.error("Connection fail: " + type(e).__name__ + " " + str(e)[:200])
+
             st.divider()
+            st.write("**Dashboard**")
+            if st.button("Data abhi refresh karein"):
+                sheet_data.clear()
+            adata = get_data()
+            if adata is None:
+                st.info("Sheet abhi padhi nahi ja saki.")
+            else:
+                recs = adata["recs"]
+                summ = board.admin_summary(recs)
+                st.caption("Sheet mein " + str(len(recs)) + " rows. Har ID ek hi baar gini gayi hai.")
+                if summ:
+                    st.dataframe(pd.DataFrame(summ), hide_index=True)
+                    exams = sorted({r["exam"] for r in recs})
+                    ex = st.selectbox("Score ka distribution (exam)", exams, key="adm_exam")
+                    scs = [r["score"] for r in board.dedupe([r for r in recs if r["exam"] == ex], "exam")]
+                    buckets = pd.Series([int(s // 10) * 10 for s in scs]).value_counts().sort_index()
+                    st.bar_chart(pd.Series(buckets.values, index=[str(b) + "-" + str(b + 9) for b in buckets.index]))
+                cn = counters()
+                st.caption(
+                    "App chalu hone ke baad: uploads " + str(cn["uploads"]) + ", valid OMR nahi " + str(cn["invalid"])
+                    + ", save hue " + str(cn["saved"]) + ", save fail " + str(cn["failed_saves"])
+                    + ", manual shift (40 se kam) " + str(cn["manual_skipped"]) + "."
+                )
+                body = board.body_rows(adata["rows"])
+                width = len(board.HEADER)
+                padded = [(list(r) + [""] * width)[:width] for r in body]
+                csv = pd.DataFrame(padded, columns=board.HEADER).to_csv(index=False).encode("utf-8-sig")
+                st.download_button("Poora data (CSV)", data=csv, file_name="omr_results.csv", mime="text/csv", key="adm_csv")
+
+            st.divider()
+            st.write("**Answer Key**")
             keys = load_keys()
             mode = st.radio("Kya karna hai?", ["Purani shift update karein", "Nayi shift add karein"], horizontal=True)
             cur = {}
