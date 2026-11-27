@@ -424,7 +424,7 @@ def handle_upload(up, name_in, cat_in, keys):
             st.error("File bahut badi hai. 10 MB se chhoti file upload karein.")
         else:
             st.error("Please upload valid OMR sheet.")
-            st.caption("Q1 se Q110 tak poori OMR sheet ka screenshot (ya uski ZIP file) hi upload karein.")
+            st.caption("Q1 se Q110 tak poori OMR sheet ki original image (ya uski ZIP file) hi upload karein. Screenshot, Edited image ya crop image accept nahi hoti.")
         return
 
     res, cnt = cached_scan(img)
@@ -570,7 +570,7 @@ with tab_c:
     else:
         name_in = st.text_input("Aapka naam", max_chars=80).strip()
         cat_in = st.selectbox("Category", [PLACEHOLDER_CAT] + board.CATEGORIES)
-        up = st.file_uploader("Apni OMR sheet upload karein (screenshot ya ZIP)", type=["png", "jpg", "jpeg", "zip"])
+        up = st.file_uploader("Apni OMR ki image (JPG/PNG) ya ZIP upload karein", type=["png", "jpg", "jpeg", "zip"])
         st.caption(NOTICE)
         if up is not None:
             handle_upload(up, name_in, cat_in, keys)
