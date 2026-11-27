@@ -664,40 +664,47 @@ with tab_a:
 
             st.divider()
             st.write("**PDF se Answer Key**")
-            kpdf = st.file_uploader("Key PDF (keyTemplate) upload karein", type=["pdf"], key="keypdf")
-            if kpdf is not None:
-                pr = keyparse.parse_key_pdf(kpdf.getvalue())
+            kpdfs = st.file_uploader("Key PDF (keyTemplate) upload karein (ek saath kai PDF chun sakte hain, 10 tak)", type=["pdf"], key="keypdf", accept_multiple_files=True)
+            kpdfs = list(kpdfs or [])[:10]
+            ready = []
+            seen_names = set()
+            for fi, kf in enumerate(kpdfs):
+                pr = keyparse.parse_key_pdf(kf.getvalue())
+                title = "PDF " + str(fi + 1) + ": " + (pr["shift"] or str(getattr(kf, "name", "")))
                 if pr["problems"]:
-                    for pmsg in pr["problems"][:6]:
-                        st.error(pmsg)
-                    st.caption("Is PDF se key nahi bani. Neeche manual box use karein.")
-                else:
-                    pdf_name = st.text_input("Shift ka naam (PDF se padha, zaroorat ho to badlein)", value=pr["shift"], key="pdfname_" + pr["shift"]).strip()
-                    pk = pr["key"]
-                    st.caption("110 jawab mile. Neeche 10-10 ke group mein hain, ek baar milakar dekh lein:")
-                    st.code("\n".join(
-                        "%3d-%3d  %s" % (i + 1, i + 10, " ".join(pk[i:i + 10])) for i in range(0, 110, 10)
-                    ))
-                    old = load_keys().get(pdf_name)
-                    over_ok = True
-                    if old:
-                        diff = [i + 1 for i in range(110) if old["key"][i:i + 1] != pk[i]]
-                        if diff:
-                            st.warning("Is naam ki key pehle se hai aur " + str(len(diff)) + " sawaalon mein alag hai: " + ", ".join(map(str, diff[:20])))
-                            over_ok = st.checkbox("Haan, purani key badalni hai", key="pdfover")
-                        else:
-                            st.info("Is naam ki key pehle se bilkul yahi hai.")
-                    if st.button("PDF wali key save karein"):
-                        if not pdf_name:
-                            st.error("Shift ka naam likhein.")
-                        elif not over_ok:
-                            st.error("Pehle 'Haan, purani key badalni hai' tick karein.")
-                        else:
-                            prev = old or {}
-                            if save_key_sheet(pdf_name, pk, float(prev.get("pos", 1.0)), float(prev.get("neg", 1 / 3)), ", ".join(prev.get("aliases", []) or [])):
-                                st.success("Save ho gaya (Sheet ke 'Keys' tab mein, permanent): " + pdf_name)
-                            else:
-                                st.warning("Sheet connect nahi hui, key save nahi hui.")
+                    st.error(title + " - " + pr["problems"][0])
+                    continue
+                pdf_name = st.text_input("Shift ka naam (PDF " + str(fi + 1) + ")", value=pr["shift"], key="pdfname_" + str(fi) + "_" + pr["shift"]).strip()
+                pk = pr["key"]
+                with st.expander(title + " - 110 jawab mile, check karein"):
+                    st.code("\n".join("%3d-%3d  %s" % (i + 1, i + 10, " ".join(pk[i:i + 10])) for i in range(0, 110, 10)))
+                if not pdf_name:
+                    st.error("PDF " + str(fi + 1) + ": shift ka naam likhein.")
+                    continue
+                if pdf_name in seen_names:
+                    st.warning("PDF " + str(fi + 1) + ": '" + pdf_name + "' ka naam upar kisi aur PDF mein bhi hai, ye wali chhodi jayegi.")
+                    continue
+                seen_names.add(pdf_name)
+                old = load_keys().get(pdf_name)
+                go = True
+                if old:
+                    diff = [i + 1 for i in range(110) if old["key"][i:i + 1] != pk[i]]
+                    if diff:
+                        st.warning(pdf_name + ": pehle se hai aur " + str(len(diff)) + " sawaalon mein alag hai: " + ", ".join(map(str, diff[:20])))
+                        go = st.checkbox("Haan, '" + pdf_name + "' ki purani key badalni hai", key="pdfover_" + str(fi))
+                    else:
+                        st.info(pdf_name + ": pehle se bilkul yahi key hai, kuch badalna nahi.")
+                        go = False
+                if go:
+                    ready.append((pdf_name, pk, old or {}))
+            if kpdfs and st.button("PDF wali keys save karein"):
+                if not ready:
+                    st.info("Save karne ke liye koi nayi ya tick ki hui key nahi hai.")
+                for nm, kk, prev in ready:
+                    if save_key_sheet(nm, kk, float(prev.get("pos", 1.0)), float(prev.get("neg", 1 / 3)), ", ".join(prev.get("aliases", []) or [])):
+                        st.success("Save ho gaya (Sheet ke 'Keys' tab mein, permanent): " + nm)
+                    else:
+                        st.warning("Sheet connect nahi hui, save nahi hui: " + nm)
 
             st.divider()
             st.write("**Answer Key (manual)**")
