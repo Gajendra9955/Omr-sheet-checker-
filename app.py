@@ -35,7 +35,7 @@ import keyparse
 import store
 from omr import scan, evaluate, read_header, pick_shift, validate_omr, images_from_zip, is_zip, MAX_FILE
 
-st.set_page_config(page_title="OMR Result Checker", page_icon="📝", layout="centered")
+st.set_page_config(page_title="OMR Result Checker created by Gajendra Verma", page_icon="📝", layout="centered")
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 KEYFILE = os.path.join(BASE, "keys.json")
